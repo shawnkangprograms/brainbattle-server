@@ -5,6 +5,9 @@ import GameResult from '../models/GameResult.js';
 // In-memory room store
 const rooms = new Map();
 
+// O(1) socket -> roomCode lookup — prevents iterating all rooms on every disconnect
+const socketRoomMap = new Map();
+
 function generateRoomCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
@@ -20,7 +23,7 @@ function shuffleArray(arr) {
 
 export function setupSocketHandlers(io) {
   io.on('connection', (socket) => {
-    console.log(`🔌 Client connected: ${socket.id}`);
+    console.log(`Client connected: ${socket.id}`);
 
     // Create room
     socket.on('create_room', ({ username, userId, mode, category, difficulty, timerSeconds, questionCount }) => {
@@ -43,25 +46,55 @@ export function setupSocketHandlers(io) {
           correct: 0,
           total: 0,
           eliminated: false,
+          disconnected: false,
           answered: false,
           answerTime: null,
         }],
         questions: [],
         currentQuestion: -1,
-        status: 'lobby', // lobby | playing | results
+        status: 'lobby',
         messages: [],
         timer: null,
+        // Guard: prevents showResults from being called twice for the same question
+        // (race between timer firing and last player submitting at the same instant)
+        showingResults: false,
       };
       rooms.set(roomCode, room);
+      socketRoomMap.set(socket.id, roomCode);
       socket.join(roomCode);
       socket.emit('room_created', { roomCode, room: sanitizeRoom(room) });
-      console.log(`🏠 Room created: ${roomCode} by ${username}`);
+      console.log(`Room created: ${roomCode} by ${username}`);
     });
 
-    // Join room
+    // Join room (also handles reconnection for disconnected players)
     socket.on('join_room', ({ roomCode, username, userId }) => {
       const room = rooms.get(roomCode);
       if (!room) return socket.emit('error', { message: 'Room not found' });
+
+      // --- Reconnection: player was in this game but lost connection ---
+      const disconnectedPlayer = room.players.find(p => p.username === username && p.disconnected);
+      if (disconnectedPlayer && room.status === 'playing') {
+        disconnectedPlayer.id = socket.id;
+        disconnectedPlayer.disconnected = false;
+        // Keep answered=true so they don't block the current question's allAnswered check
+        // (they missed the question while disconnected)
+        socketRoomMap.set(socket.id, roomCode);
+        socket.join(roomCode);
+        socket.emit('reconnect_to_game', {
+          roomCode,
+          score: disconnectedPlayer.score,
+          eliminated: disconnectedPlayer.eliminated,
+          totalQuestions: room.questions.length,
+          questionIndex: room.currentQuestion,
+        });
+        io.to(roomCode).emit('player_joined', {
+          player: sanitizePlayer(disconnectedPlayer),
+          players: room.players.map(sanitizePlayer),
+        });
+        console.log(`${username} reconnected to room ${roomCode}`);
+        return;
+      }
+
       if (room.status !== 'lobby') return socket.emit('error', { message: 'Game already in progress' });
       if (room.players.length >= 20) return socket.emit('error', { message: 'Room is full (max 20)' });
       if (room.players.find(p => p.username === username))
@@ -77,15 +110,17 @@ export function setupSocketHandlers(io) {
         correct: 0,
         total: 0,
         eliminated: false,
+        disconnected: false,
         answered: false,
         answerTime: null,
       };
       room.players.push(player);
+      socketRoomMap.set(socket.id, roomCode);
       socket.join(roomCode);
 
       socket.emit('room_joined', { roomCode, room: sanitizeRoom(room) });
       io.to(roomCode).emit('player_joined', { player: sanitizePlayer(player), players: room.players.map(sanitizePlayer) });
-      console.log(`👤 ${username} joined room ${roomCode}`);
+      console.log(`${username} joined room ${roomCode}`);
     });
 
     // Chat message
@@ -117,12 +152,17 @@ export function setupSocketHandlers(io) {
     });
 
     // Submit answer
-    socket.on('submit_answer', ({ roomCode, answer }) => {
+    // Client must send the questionIndex it believes is current — we reject stale answers
+    // that arrive after the question has already advanced (prevents wrong-question scoring)
+    socket.on('submit_answer', ({ roomCode, answer, questionIndex }) => {
       const room = rooms.get(roomCode);
       if (!room || room.status !== 'playing') return;
 
+      // Reject stale answer from a previous question
+      if (questionIndex !== undefined && questionIndex !== room.currentQuestion) return;
+
       const player = room.players.find(p => p.id === socket.id);
-      if (!player || player.answered || player.eliminated) return;
+      if (!player || player.answered || player.eliminated || player.disconnected) return;
 
       const q = room.questions[room.currentQuestion];
       if (!q) return;
@@ -135,10 +175,9 @@ export function setupSocketHandlers(io) {
       const timeElapsed = (player.answerTime - room.questionStartTime) / 1000;
       const timeBonus = Math.max(0, Math.round((room.timerSeconds - timeElapsed) / room.timerSeconds * 300));
 
-      console.log(`📝 ${player.username} answered: "${answer}" | correct: "${q.correct_answer}" | isCorrect: ${isCorrect} | mode: ${room.mode}`);
+      console.log(`${player.username} answered | correct: ${isCorrect} | mode: ${room.mode}`);
 
       if (isCorrect) {
-        // CORRECT — never eliminate, regardless of mode
         player.streak++;
         player.bestStreak = Math.max(player.bestStreak, player.streak);
         player.correct++;
@@ -147,12 +186,10 @@ export function setupSocketHandlers(io) {
         player.score += gained;
         socket.emit('answer_result', { correct: true, points: gained, timeBonus, streakBonus, streak: player.streak });
       } else {
-        // WRONG — eliminate only in sudden death
         player.streak = 0;
         socket.emit('answer_result', { correct: false, points: 0, correctAnswer: q.correct_answer });
         if (room.mode === 'sudden_death') {
           player.eliminated = true;
-          // Delay the eliminated event so client can show the wrong-answer reveal first
           setTimeout(() => {
             socket.emit('eliminated', { correctAnswer: q.correct_answer });
             io.to(roomCode).emit('player_eliminated', { username: player.username });
@@ -160,10 +197,10 @@ export function setupSocketHandlers(io) {
         }
       }
 
-      // Advance when all NON-eliminated players have answered
-      const activePlayers = room.players.filter(p => !p.eliminated);
-      const allAnswered = activePlayers.every(p => p.answered);
-      if (allAnswered) {
+      // Advance when all active (non-eliminated, non-disconnected) players have answered
+      const activePlayers = room.players.filter(p => !p.eliminated && !p.disconnected);
+      const allAnswered = activePlayers.length === 0 || activePlayers.every(p => p.answered);
+      if (allAnswered && !room.showingResults) {
         clearTimeout(room.timer);
         showResults(io, room, roomCode);
       }
@@ -177,6 +214,7 @@ export function setupSocketHandlers(io) {
       if (target) {
         io.to(target.id).emit('kicked');
         room.players = room.players.filter(p => p.username !== username);
+        socketRoomMap.delete(target.id);
         io.to(roomCode).emit('player_left', { username, players: room.players.map(sanitizePlayer) });
       }
     });
@@ -184,8 +222,10 @@ export function setupSocketHandlers(io) {
     socket.on('skip_question', ({ roomCode }) => {
       const room = rooms.get(roomCode);
       if (!room || room.host !== socket.id) return;
-      clearTimeout(room.timer);
-      showResults(io, room, roomCode);
+      if (!room.showingResults) {
+        clearTimeout(room.timer);
+        showResults(io, room, roomCode);
+      }
     });
 
     socket.on('end_game', ({ roomCode }) => {
@@ -204,43 +244,88 @@ export function setupSocketHandlers(io) {
 
     // Disconnect
     socket.on('disconnect', () => {
-      rooms.forEach((room, roomCode) => {
-        const idx = room.players.findIndex(p => p.id === socket.id);
-        if (idx !== -1) {
-          const username = room.players[idx].username;
-          room.players.splice(idx, 1);
-          io.to(roomCode).emit('player_left', { username, players: room.players.map(sanitizePlayer) });
+      const roomCode = socketRoomMap.get(socket.id);
+      socketRoomMap.delete(socket.id);
 
-          if (room.players.length === 0) {
-            clearTimeout(room.timer);
-            rooms.delete(roomCode);
-          } else if (room.host === socket.id && room.players.length > 0) {
-            room.host = room.players[0].id;
-            io.to(room.host).emit('host_transferred');
+      if (!roomCode) {
+        console.log(`Client disconnected (no room): ${socket.id}`);
+        return;
+      }
+
+      const room = rooms.get(roomCode);
+      if (!room) return;
+
+      const idx = room.players.findIndex(p => p.id === socket.id);
+      if (idx === -1) return;
+
+      const player = room.players[idx];
+      const username = player.username;
+
+      if (room.status === 'playing') {
+        // During gameplay: keep the player in the room but mark as disconnected.
+        // This prevents a brief network hiccup from kicking them permanently.
+        // Mark answered=true so they don't permanently block the allAnswered check.
+        player.disconnected = true;
+        player.answered = true;
+
+        io.to(roomCode).emit('player_left', { username, players: room.players.map(sanitizePlayer) });
+
+        // If all remaining connected+active players have now answered, advance
+        const activePlayers = room.players.filter(p => !p.eliminated && !p.disconnected);
+        if (activePlayers.length === 0) {
+          // No connected players left — end the game
+          clearTimeout(room.timer);
+          finishGame(io, room, roomCode);
+        } else if (activePlayers.every(p => p.answered) && !room.showingResults) {
+          clearTimeout(room.timer);
+          showResults(io, room, roomCode);
+        }
+
+        // Transfer host if the disconnecting player was host
+        if (room.host === socket.id) {
+          const newHost = room.players.find(p => !p.disconnected);
+          if (newHost) {
+            room.host = newHost.id;
+            io.to(newHost.id).emit('host_transferred');
           }
         }
-      });
-      console.log(`🔌 Client disconnected: ${socket.id}`);
+      } else {
+        // Lobby or results: remove permanently
+        room.players.splice(idx, 1);
+        io.to(roomCode).emit('player_left', { username, players: room.players.map(sanitizePlayer) });
+
+        if (room.players.length === 0) {
+          clearTimeout(room.timer);
+          rooms.delete(roomCode);
+        } else if (room.host === socket.id) {
+          room.host = room.players[0].id;
+          io.to(room.host).emit('host_transferred');
+        }
+      }
+
+      console.log(`Client disconnected: ${socket.id} (${username})`);
     });
   });
 }
 
 function sendQuestion(io, room, roomCode) {
+  // Reset the results guard so the new question can call showResults
+  room.showingResults = false;
+
   room.currentQuestion++;
   if (room.currentQuestion >= room.questions.length) {
     return finishGame(io, room, roomCode);
   }
 
-  // Reset answered states for NON-eliminated players only
-  // Eliminated players keep answered=true so they never block the "all answered" check
+  // Reset answered for connected, non-eliminated players only.
+  // Eliminated and disconnected players stay answered=true so they never block the check.
   room.players.forEach(p => {
-    if (!p.eliminated) {
+    if (!p.eliminated && !p.disconnected) {
       p.answered = false;
       p.answerTime = null;
     }
   });
   room.questionStartTime = Date.now();
-  console.log(`📢 Q${room.currentQuestion + 1} | Mode: ${room.mode} | Active: ${room.players.filter(p=>!p.eliminated).map(p=>p.username).join(', ')} | Eliminated: ${room.players.filter(p=>p.eliminated).map(p=>p.username).join(', ') || 'none'}`);
 
   const q = room.questions[room.currentQuestion];
   const answers = shuffleArray([q.correct_answer, ...q.incorrect_answers]);
@@ -255,16 +340,27 @@ function sendQuestion(io, room, roomCode) {
     timerSeconds: room.timerSeconds,
   });
 
+  // Set server-side timer. showResults is guarded so it can only fire once per question.
   room.timer = setTimeout(() => {
     showResults(io, room, roomCode);
   }, room.timerSeconds * 1000);
+
+  const active = room.players.filter(p => !p.eliminated && !p.disconnected).map(p => p.username);
+  console.log(`Q${room.currentQuestion + 1} | Active: ${active.join(', ') || 'none'}`);
 }
 
 function showResults(io, room, roomCode) {
+  // Critical guard: prevents double-invocation from the "all answered" path
+  // and the server timer firing at nearly the same moment.
+  // Without this, two sendQuestion() calls would be scheduled, skipping questions
+  // and causing stale answers to be processed against the wrong question.
+  if (room.showingResults) return;
+  room.showingResults = true;
+
   const q = room.questions[room.currentQuestion];
   const leaderboard = [...room.players]
     .sort((a, b) => b.score - a.score)
-    .map((p, i) => ({ username: p.username, score: p.score, rank: i + 1, eliminated: p.eliminated }));
+    .map((p, i) => ({ username: p.username, score: p.score, rank: i + 1, eliminated: p.eliminated, disconnected: p.disconnected }));
 
   io.to(roomCode).emit('question_results', {
     correctAnswer: q.correct_answer,
@@ -272,18 +368,13 @@ function showResults(io, room, roomCode) {
     questionIndex: room.currentQuestion,
   });
 
-  const activePlayers = room.players.filter(p => !p.eliminated);
+  const activePlayers = room.players.filter(p => !p.eliminated && !p.disconnected);
   const eliminatedPlayers = room.players.filter(p => p.eliminated);
-  const totalPlayers = room.players.length;
 
-  // Sudden death ends only when:
-  // - More than 1 player started AND only 1 (or 0) remain active, OR
-  // - All players are eliminated (everyone got it wrong on same question)
   const suddenDeathOver =
     room.mode === 'sudden_death' &&
-    eliminatedPlayers.length > 0 &&        // at least someone was actually eliminated
-    (activePlayers.length <= 1 ||           // only 1 survivor
-     activePlayers.length === 0);           // everyone eliminated on same question
+    eliminatedPlayers.length > 0 &&
+    (activePlayers.length <= 1 || activePlayers.length === 0);
 
   if (suddenDeathOver) {
     setTimeout(() => finishGame(io, room, roomCode), 3500);
@@ -309,7 +400,6 @@ async function finishGame(io, room, roomCode) {
 
   io.to(roomCode).emit('game_over', { finalRanking });
 
-  // Save results to DB
   try {
     await GameResult.create({
       roomCode,
@@ -327,22 +417,21 @@ async function finishGame(io, room, roomCode) {
       totalQuestions: room.questions.length,
     });
 
-    // Update registered user stats
-    for (const player of room.players) {
-      if (player.userId) {
-        const rank = finalRanking.findIndex(p => p.username === player.username) + 1;
-        await User.findByIdAndUpdate(player.userId, {
-          $inc: {
-            'stats.totalGames': 1,
-            'stats.totalWins': rank === 1 ? 1 : 0,
-            'stats.totalScore': player.score,
-            'stats.correctAnswers': player.correct,
-            'stats.totalAnswers': player.total,
-          },
-          $max: { 'stats.bestStreak': player.bestStreak },
-        });
-      }
-    }
+    // Update registered user stats in parallel
+    const registeredPlayers = room.players.filter(p => p.userId);
+    await Promise.all(registeredPlayers.map(player => {
+      const rank = finalRanking.findIndex(p => p.username === player.username) + 1;
+      return User.findByIdAndUpdate(player.userId, {
+        $inc: {
+          'stats.totalGames': 1,
+          'stats.totalWins': rank === 1 ? 1 : 0,
+          'stats.totalScore': player.score,
+          'stats.correctAnswers': player.correct,
+          'stats.totalAnswers': player.total,
+        },
+        $max: { 'stats.bestStreak': player.bestStreak },
+      });
+    }));
   } catch (err) {
     console.error('Failed to save game results:', err.message);
   }
@@ -363,5 +452,12 @@ function sanitizeRoom(room) {
 }
 
 function sanitizePlayer(p) {
-  return { id: p.id, username: p.username, score: p.score, streak: p.streak, eliminated: p.eliminated };
+  return {
+    id: p.id,
+    username: p.username,
+    score: p.score,
+    streak: p.streak,
+    eliminated: p.eliminated,
+    disconnected: p.disconnected || false,
+  };
 }

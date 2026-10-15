@@ -36,6 +36,14 @@ const corsOptions = {
 
 const io = new Server(httpServer, { cors: corsOptions });
 
+// --- ADD THIS HERE ---
+app.all('/api/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'ok - BrainBattle server online ', 
+    timestamp: new Date().toISOString() 
+  });
+});
+
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // handle preflight
 app.use(express.json());
@@ -44,7 +52,8 @@ app.use('/api/auth', authRoutes);
 app.use('/api/questions', questionRoutes);
 app.use('/api/leaderboard', leaderboardRoutes);
 
-app.get('/api/health', (req, res) => res.json({ status: 'BrainBattle server online 🧠' }));
+// REPLACED THIS DUPLICATE HEALTH CHECK WITH THE ONE ABOVE TO ENSURE IT'S ALWAYS PRESENT
+//app.get('/api/health', (req, res) => res.json({ status: 'BrainBattle server online 🧠' }));
 
 setupSocketHandlers(io);
 
