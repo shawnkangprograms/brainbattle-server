@@ -37,7 +37,7 @@ const corsOptions = {
 const io = new Server(httpServer, { cors: corsOptions });
 
 // --- ADD THIS HERE ---
-app.all('/api/health', (req, res) => {
+app.all('/api/health', cors(), (req, res) => {
   res.status(200).json({ 
     status: 'ok - BrainBattle server online ', 
     timestamp: new Date().toISOString() 
